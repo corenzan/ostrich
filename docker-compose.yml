@@ -1,0 +1,27 @@
+version: "3"
+services:
+  proxy:
+    image: traefik:2.3
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - 8080:8080
+      - 80:80
+    command:
+      - --api.insecure=true
+      - --providers.docker.defaultrule=Host(`{{ normalize .Name }}.localhost`)
+  web:
+    build: .
+    depends_on:
+      - database
+    ports:
+      - 3000
+    volumes:
+      - .:/go/src/app
+    environment:
+      PORT: 3001
+      DATABASE_URL: postgres://postgres:123@database/postgres?sslmode=disable
+  database:
+    image: postgres:13-alpine
+    environment:
+      - POSTGRES_PASSWORD=123
