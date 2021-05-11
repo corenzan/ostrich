@@ -2,7 +2,7 @@
 
 > https://ostrich.crz.li
 
-## Usage
+## About
 
 ...
 

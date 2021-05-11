@@ -12,16 +12,9 @@ services:
       - --providers.docker.defaultrule=Host(`{{ normalize .Name }}.localhost`)
   web:
     build: .
-    depends_on:
-      - database
     ports:
       - 3000
     volumes:
-      - .:/go/src/app
+      - .:/app
     environment:
       PORT: 3001
-      DATABASE_URL: postgres://postgres:123@database/postgres?sslmode=disable
-  database:
-    image: postgres:13-alpine
-    environment:
-      - POSTGRES_PASSWORD=123

@@ -1,83 +1,111 @@
 package main
 
 import (
-	"context"
 	"log"
-	"net/http"
 	"os"
-	"time"
 
 	"github.com/gofiber/fiber/v2"
-	"github.com/gofiber/fiber/v2/middleware/cors"
-	"github.com/gofiber/fiber/v2/middleware/etag"
-	"github.com/gofiber/fiber/v2/middleware/limiter"
 	"github.com/gofiber/fiber/v2/middleware/logger"
-
-	"github.com/jackc/pgx/v4"
-	"github.com/jackc/pgx/v4/pgxpool"
+	"github.com/gofiber/websocket/v2"
+	"github.com/rs/xid"
 )
 
-func exists(db *pgxpool.Pool, path string) (bool, error) {
-	sql := `SELECT 1 FROM documents WHERE path = $1;`
-	if err := db.QueryRow(context.Background(), sql, path).Scan(nil); err != pgx.ErrNoRows {
-		if err == nil {
-			return true, nil
-		}
-		return false, err
-	}
-	return false, nil
+type message struct {
+	Protocol  string            `json:"protocol"`
+	Namespace string            `json:"namespace"`
+	Operation string            `json:"operation"`
+	Meta      map[string]string `json:"meta"`
+	Payload   interface{}       `json:"payload"`
 }
 
-func create(db *pgxpool.Pool, path string, contents interface{}) error {
-	sql := `INSERT INTO documents (path, contents) VALUES ($1, $2);`
-	if _, err := db.Exec(context.Background(), sql, path, contents); err != nil {
-		return err
+type namespace map[string]*websocket.Conn
+
+type broker struct {
+	clients  map[string]namespace
+	dispatch chan message
+}
+
+func (b *broker) push(conn *websocket.Conn) (string, string) {
+	ns := conn.Params("+1")
+	id := xid.New().String()
+	if b.clients[ns] == nil {
+		b.clients[ns] = map[string]*websocket.Conn{}
 	}
-	return nil
+	b.clients[ns][id] = conn
+	return ns, id
+}
+
+func (b *broker) drop(ns, id string) {
+	b.clients[ns][id].Close()
+
+	delete(b.clients[ns], id)
+
+	if len(b.clients[ns]) == 0 {
+		delete(b.clients, ns)
+	}
+}
+
+func (b *broker) listen() {
+	for {
+		msg := <-b.dispatch
+
+		if recipient, ok := msg.Meta["recipient"]; ok {
+			if conn, ok := b.clients[msg.Namespace][recipient]; ok {
+				if err := conn.WriteJSON(msg); err != nil {
+					log.Println("failed to send message:", err)
+				}
+			}
+		} else {
+			for id, conn := range b.clients[msg.Namespace] {
+				if id != msg.Meta["sender"] {
+					if err := conn.WriteJSON(msg); err != nil {
+						log.Println("failed to send message:", err)
+					}
+				}
+			}
+		}
+	}
 }
 
 func main() {
-	db, err := pgxpool.Connect(context.Background(), os.Getenv("DATABASE_URL"))
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer db.Close()
-
 	app := fiber.New()
 
 	app.Use(logger.New())
 
-	app.Use(limiter.New(limiter.Config{
-		Max:      100,
-		Duration: 60 * time.Second,
-	}))
-
-	app.Use(cors.New(cors.Config{
-		AllowOrigins: "*",
-	}))
-
-	app.Use(etag.New())
-
-	app.Put("/d/+", func(c *fiber.Ctx) error {
-		c.Type("json", "utf-8")
-
-		var contents interface{}
-		if err := c.BodyParser(&contents); err != nil {
-			return c.Status(http.StatusBadRequest).Send(nil)
+	app.Use(func(c *fiber.Ctx) error {
+		if websocket.IsWebSocketUpgrade(c) {
+			return c.Next()
 		}
-
-		if conflict, err := exists(db, c.Params("+")); err != nil {
-			return err
-		} else if conflict {
-			return c.Status(http.StatusConflict).Send(nil)
-		}
-
-		if err := create(db, c.Params("+"), contents); err != nil {
-			return err
-		}
-
-		return c.Status(http.StatusCreated).JSON(contents)
+		return c.SendStatus(fiber.StatusUpgradeRequired)
 	})
+
+	b := &broker{
+		clients:  make(map[string]namespace),
+		dispatch: make(chan message),
+	}
+
+	go b.listen()
+
+	app.Get("/+", websocket.New(func(conn *websocket.Conn) {
+		ns, id := b.push(conn)
+
+		defer b.drop(ns, id)
+
+		var msg message
+
+		for {
+			if err := conn.ReadJSON(&msg); err != nil {
+				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+					log.Println("failed to read message:", err)
+				}
+				return
+			}
+			msg.Namespace = ns
+			msg.Meta["sender"] = id
+			log.Println("message received:", msg)
+			b.dispatch <- msg
+		}
+	}))
 
 	app.Listen(":" + os.Getenv("PORT"))
 }
