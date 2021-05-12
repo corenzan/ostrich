@@ -11,57 +11,78 @@ import (
 )
 
 type message struct {
-	Protocol  string            `json:"protocol"`
-	Namespace string            `json:"namespace"`
-	Operation string            `json:"operation"`
-	Meta      map[string]string `json:"meta"`
-	Payload   interface{}       `json:"payload"`
+	Type    string      `json:"type"`
+	Payload interface{} `json:"payload"`
 }
 
-type namespace map[string]*websocket.Conn
+type client struct {
+	channel string
+	id      string
+}
+
+type envelope struct {
+	message message
+	client  client
+}
 
 type broker struct {
-	clients  map[string]namespace
-	dispatch chan message
+	registry  map[string]map[string]*websocket.Conn
+	stale     map[string]map[string]struct{}
+	broadcast chan envelope
 }
 
-func (b *broker) push(conn *websocket.Conn) (string, string) {
-	ns := conn.Params("+1")
-	id := xid.New().String()
-	if b.clients[ns] == nil {
-		b.clients[ns] = map[string]*websocket.Conn{}
+func (b *broker) newClient(conn *websocket.Conn) *client {
+	c := &client{
+		channel: conn.Params("+1"),
+		id:      xid.New().String(),
 	}
-	b.clients[ns][id] = conn
-	return ns, id
-}
-
-func (b *broker) drop(ns, id string) {
-	b.clients[ns][id].Close()
-
-	delete(b.clients[ns], id)
-
-	if len(b.clients[ns]) == 0 {
-		delete(b.clients, ns)
+	if b.registry[c.channel] == nil {
+		b.registry[c.channel] = map[string]*websocket.Conn{}
+		b.stale[c.channel] = map[string]struct{}{}
+	} else {
+		b.stale[c.channel][c.id] = struct{}{}
 	}
+	b.registry[c.channel][c.id] = conn
+	return c
 }
+
+func (b *broker) dropClient(c *client) {
+	b.registry[c.channel][c.id].Close()
+
+	delete(b.registry[c.channel], c.id)
+	delete(b.stale[c.channel], c.id)
+
+	if len(b.registry[c.channel]) == 0 {
+		delete(b.registry, c.channel)
+		delete(b.stale, c.channel)
+	}
+
+	log.Printf("%+v", b)
+}
+
+const syncMessageType = "ostrich/sync"
 
 func (b *broker) listen() {
 	for {
-		msg := <-b.dispatch
+		e := <-b.broadcast
 
-		if recipient, ok := msg.Meta["recipient"]; ok {
-			if conn, ok := b.clients[msg.Namespace][recipient]; ok {
-				if err := conn.WriteJSON(msg); err != nil {
-					log.Println("failed to send message:", err)
-				}
+		sync := e.message.Type == syncMessageType
+
+		for id, conn := range b.registry[e.client.channel] {
+			_, stale := b.stale[e.client.channel][id]
+
+			if id == e.client.id {
+				continue
 			}
-		} else {
-			for id, conn := range b.clients[msg.Namespace] {
-				if id != msg.Meta["sender"] {
-					if err := conn.WriteJSON(msg); err != nil {
-						log.Println("failed to send message:", err)
-					}
-				}
+
+			if stale && !sync {
+				continue
+			}
+
+			if err := conn.WriteJSON(e.message); err == nil {
+				delete(b.stale[e.client.channel], id)
+			} else {
+				log.Println("failed to send message:", err)
 			}
 		}
 	}
@@ -80,31 +101,33 @@ func main() {
 	})
 
 	b := &broker{
-		clients:  make(map[string]namespace),
-		dispatch: make(chan message),
+		registry:  make(map[string]map[string]*websocket.Conn),
+		stale:     make(map[string]map[string]struct{}),
+		broadcast: make(chan envelope),
 	}
 
 	go b.listen()
 
 	app.Get("/+", websocket.New(func(conn *websocket.Conn) {
-		ns, id := b.push(conn)
+		c := b.newClient(conn)
 
-		defer b.drop(ns, id)
+		defer b.dropClient(c)
 
-		var msg message
+		var m message
 
 		for {
-			if err := conn.ReadJSON(&msg); err != nil {
+			if err := conn.ReadJSON(&m); err != nil {
 				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 					log.Println("failed to read message:", err)
+					return
 				}
-				return
+				continue
 			}
-			msg.Namespace = ns
-			msg.Meta["sender"] = id
-			log.Println("message received:", msg)
-			b.dispatch <- msg
+			log.Println("message received:", m)
+
+			b.broadcast <- envelope{m, *c}
 		}
+
 	}))
 
 	app.Listen(":" + os.Getenv("PORT"))
