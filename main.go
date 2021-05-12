@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"io"
 	"log"
 	"os"
 
@@ -11,8 +13,9 @@ import (
 )
 
 type message struct {
-	Type    string      `json:"type"`
-	Payload interface{} `json:"payload"`
+	Type    string                 `json:"type"`
+	Meta    map[string]interface{} `json:"meta"`
+	Payload interface{}            `json:"payload"`
 }
 
 type client struct {
@@ -26,8 +29,8 @@ type envelope struct {
 }
 
 type broker struct {
-	registry  map[string]map[string]*websocket.Conn
-	stale     map[string]map[string]struct{}
+	clients   map[string]map[string]*websocket.Conn
+	synced    map[string]map[string]struct{}
 	broadcast chan envelope
 }
 
@@ -36,53 +39,84 @@ func (b *broker) newClient(conn *websocket.Conn) *client {
 		channel: conn.Params("+1"),
 		id:      xid.New().String(),
 	}
-	if b.registry[c.channel] == nil {
-		b.registry[c.channel] = map[string]*websocket.Conn{}
-		b.stale[c.channel] = map[string]struct{}{}
+	if b.clients[c.channel] == nil {
+		b.clients[c.channel] = map[string]*websocket.Conn{}
+		b.synced[c.channel] = map[string]struct{}{
+			c.id: {},
+		}
 	} else {
-		b.stale[c.channel][c.id] = struct{}{}
+		b.broadcast <- envelope{message{syncReqType, nil, nil}, client{c.channel, ""}}
 	}
-	b.registry[c.channel][c.id] = conn
+	b.clients[c.channel][c.id] = conn
 	return c
 }
 
 func (b *broker) dropClient(c *client) {
-	b.registry[c.channel][c.id].Close()
+	b.clients[c.channel][c.id].Close()
 
-	delete(b.registry[c.channel], c.id)
-	delete(b.stale[c.channel], c.id)
+	delete(b.clients[c.channel], c.id)
+	delete(b.synced[c.channel], c.id)
 
-	if len(b.registry[c.channel]) == 0 {
-		delete(b.registry, c.channel)
-		delete(b.stale, c.channel)
+	if len(b.clients[c.channel]) == 0 {
+		delete(b.clients, c.channel)
+		delete(b.synced, c.channel)
+	} else if len(b.synced[c.channel]) == 0 {
+		for id := range b.clients[c.channel] {
+			b.synced[c.channel][id] = struct{}{}
+			break
+		}
 	}
 
 	log.Printf("%+v", b)
 }
 
-const syncMessageType = "ostrich/sync"
+const syncRepType = "ostrich/sync/reply"
+const syncReqType = "ostrich/sync/request"
 
 func (b *broker) listen() {
 	for {
 		e := <-b.broadcast
 
-		sync := e.message.Type == syncMessageType
+		if e.message.Meta == nil {
+			e.message.Meta = map[string]interface{}{}
+		}
+		e.message.Meta["remote"] = true
 
-		for id, conn := range b.registry[e.client.channel] {
-			_, stale := b.stale[e.client.channel][id]
+		log.Printf("broadcasting %+v", e)
+
+		for id, conn := range b.clients[e.client.channel] {
+			log.Printf("checking to dispatch to %+v", id)
 
 			if id == e.client.id {
 				continue
 			}
 
-			if stale && !sync {
-				continue
+			log.Println("not same id")
+
+			_, synced := b.synced[e.client.channel][id]
+
+			if synced {
+				log.Println("listener is synced")
+				if e.message.Type == syncRepType {
+					continue
+				}
+			} else {
+				log.Println("listener is not synced")
+				if e.message.Type != syncRepType {
+					continue
+				}
 			}
 
+			log.Println("writing message")
+
 			if err := conn.WriteJSON(e.message); err == nil {
-				delete(b.stale[e.client.channel], id)
+				b.synced[e.client.channel][id] = struct{}{}
 			} else {
 				log.Println("failed to send message:", err)
+			}
+
+			if e.message.Type == syncReqType {
+				break
 			}
 		}
 	}
@@ -101,8 +135,8 @@ func main() {
 	})
 
 	b := &broker{
-		registry:  make(map[string]map[string]*websocket.Conn),
-		stale:     make(map[string]map[string]struct{}),
+		clients:   make(map[string]map[string]*websocket.Conn),
+		synced:    make(map[string]map[string]struct{}),
 		broadcast: make(chan envelope),
 	}
 
@@ -113,15 +147,21 @@ func main() {
 
 		defer b.dropClient(c)
 
-		var m message
-
 		for {
+			var m message
+
 			if err := conn.ReadJSON(&m); err != nil {
-				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-					log.Println("failed to read message:", err)
-					return
+				log.Println("failed to read message:", err)
+
+				if err == io.ErrUnexpectedEOF {
+					continue
+				} else if _, ok := err.(*json.UnmarshalTypeError); ok {
+					continue
+				} else if _, ok := err.(*json.SyntaxError); ok {
+					continue
 				}
-				continue
+
+				return
 			}
 			log.Println("message received:", m)
 
