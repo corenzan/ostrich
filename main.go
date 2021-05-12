@@ -67,7 +67,6 @@ func (b *broker) dropClient(c *client) {
 		}
 	}
 
-	log.Printf("%+v", b)
 }
 
 const syncRepType = "ostrich/sync/reply"
@@ -82,32 +81,22 @@ func (b *broker) listen() {
 		}
 		e.message.Meta["remote"] = true
 
-		log.Printf("broadcasting %+v", e)
-
 		for id, conn := range b.clients[e.client.channel] {
-			log.Printf("checking to dispatch to %+v", id)
-
 			if id == e.client.id {
 				continue
 			}
 
-			log.Println("not same id")
-
 			_, synced := b.synced[e.client.channel][id]
 
 			if synced {
-				log.Println("listener is synced")
 				if e.message.Type == syncRepType {
 					continue
 				}
 			} else {
-				log.Println("listener is not synced")
 				if e.message.Type != syncRepType {
 					continue
 				}
 			}
-
-			log.Println("writing message")
 
 			if err := conn.WriteJSON(e.message); err == nil {
 				b.synced[e.client.channel][id] = struct{}{}
@@ -167,7 +156,6 @@ func main() {
 
 			b.broadcast <- envelope{m, *c}
 		}
-
 	}))
 
 	app.Listen(":" + os.Getenv("PORT"))
