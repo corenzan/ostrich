@@ -34,7 +34,7 @@ type envelope struct {
 
 type broker struct {
 	clients   map[string]map[client]struct{}
-	synced    map[string]map[client]struct{}
+	stale     map[string]map[client]struct{}
 	broadcast chan envelope
 }
 
@@ -48,15 +48,14 @@ func (b *broker) client(conn *websocket.Conn) client {
 		b.clients[c.channel] = map[client]struct{}{
 			c: {},
 		}
-		b.synced[c.channel] = map[client]struct{}{
-			c: {},
-		}
+		b.stale[c.channel] = map[client]struct{}{}
 	} else {
 		b.broadcast <- envelope{
 			sender:  client{c.channel, "", nil},
 			message: message{messageTypeSyncRequest, nil, nil},
 		}
 		b.clients[c.channel][c] = struct{}{}
+		b.stale[c.channel][c] = struct{}{}
 	}
 	return c
 }
@@ -65,14 +64,14 @@ func (b *broker) drop(c client) {
 	c.conn.Close()
 
 	delete(b.clients[c.channel], c)
-	delete(b.synced[c.channel], c)
+	delete(b.stale[c.channel], c)
 
-	if len(b.clients[c.channel]) == 0 {
+	if l := len(b.clients[c.channel]); l == 0 {
 		delete(b.clients, c.channel)
-		delete(b.synced, c.channel)
-	} else if len(b.synced[c.channel]) == 0 {
-		for c := range b.clients[c.channel] {
-			b.synced[c.channel][c] = struct{}{}
+		delete(b.stale, c.channel)
+	} else if l == len(b.stale[c.channel]) {
+		for c := range b.stale[c.channel] {
+			delete(b.stale[c.channel], c)
 			break
 		}
 	}
@@ -92,20 +91,20 @@ func (b *broker) listen() {
 				continue
 			}
 
-			_, synced := b.synced[e.sender.channel][c]
+			_, stale := b.stale[e.sender.channel][c]
 
-			if synced {
-				if e.message.Type == messageTypeSyncReply {
+			if stale {
+				if e.message.Type != messageTypeSyncReply {
 					continue
 				}
 			} else {
-				if e.message.Type != messageTypeSyncReply {
+				if e.message.Type == messageTypeSyncReply {
 					continue
 				}
 			}
 
 			if err := c.conn.WriteJSON(e.message); err == nil {
-				b.synced[e.sender.channel][c] = struct{}{}
+				delete(b.stale[c.channel], c)
 			} else {
 				log.Println("failed to send message:", err)
 			}
@@ -129,7 +128,7 @@ func main() {
 
 	b := &broker{
 		clients:   make(map[string]map[client]struct{}),
-		synced:    make(map[string]map[client]struct{}),
+		stale:     make(map[string]map[client]struct{}),
 		broadcast: make(chan envelope),
 	}
 
