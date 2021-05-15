@@ -12,6 +12,11 @@ import (
 	"github.com/gofiber/websocket/v2"
 )
 
+const (
+	messageTypeSyncReply   = "ostrich/sync/reply"
+	messageTypeSyncRequest = "ostrich/sync/request"
+)
+
 func newId() string {
 	return fmt.Sprintf("%x", rand.Uint32())
 }
@@ -25,38 +30,43 @@ type message struct {
 type client struct {
 	channel string
 	id      string
+	conn    *websocket.Conn
 }
 
 type envelope struct {
+	sender  client
 	message message
-	client  client
 }
 
 type broker struct {
-	clients   map[string]map[string]*websocket.Conn
+	clients   map[string]map[string]client
 	synced    map[string]map[string]struct{}
 	broadcast chan envelope
 }
 
-func (b *broker) newClient(conn *websocket.Conn) *client {
-	c := &client{
+func (b *broker) client(conn *websocket.Conn) client {
+	c := client{
 		channel: conn.Params("+1"),
 		id:      newId(),
+		conn:    conn,
 	}
 	if b.clients[c.channel] == nil {
-		b.clients[c.channel] = map[string]*websocket.Conn{}
+		b.clients[c.channel] = map[string]client{}
 		b.synced[c.channel] = map[string]struct{}{
 			c.id: {},
 		}
 	} else {
-		b.broadcast <- envelope{message{syncReqType, nil, nil}, client{c.channel, ""}}
+		b.broadcast <- envelope{
+			sender:  client{c.channel, "", nil},
+			message: message{messageTypeSyncRequest, nil, nil},
+		}
 	}
-	b.clients[c.channel][c.id] = conn
+	b.clients[c.channel][c.id] = c
 	return c
 }
 
-func (b *broker) dropClient(c *client) {
-	b.clients[c.channel][c.id].Close()
+func (b *broker) drop(c client) {
+	c.conn.Close()
 
 	delete(b.clients[c.channel], c.id)
 	delete(b.synced[c.channel], c.id)
@@ -73,9 +83,6 @@ func (b *broker) dropClient(c *client) {
 
 }
 
-const syncRepType = "ostrich/sync/reply"
-const syncReqType = "ostrich/sync/request"
-
 func (b *broker) listen() {
 	for {
 		e := <-b.broadcast
@@ -85,30 +92,30 @@ func (b *broker) listen() {
 		}
 		e.message.Meta["remote"] = true
 
-		for id, conn := range b.clients[e.client.channel] {
-			if id == e.client.id {
+		for id, c := range b.clients[e.sender.channel] {
+			if id == e.sender.id {
 				continue
 			}
 
-			_, synced := b.synced[e.client.channel][id]
+			_, synced := b.synced[e.sender.channel][id]
 
 			if synced {
-				if e.message.Type == syncRepType {
+				if e.message.Type == messageTypeSyncReply {
 					continue
 				}
 			} else {
-				if e.message.Type != syncRepType {
+				if e.message.Type != messageTypeSyncReply {
 					continue
 				}
 			}
 
-			if err := conn.WriteJSON(e.message); err == nil {
-				b.synced[e.client.channel][id] = struct{}{}
+			if err := c.conn.WriteJSON(e.message); err == nil {
+				b.synced[e.sender.channel][id] = struct{}{}
 			} else {
 				log.Println("failed to send message:", err)
 			}
 
-			if e.message.Type == syncReqType {
+			if e.message.Type == messageTypeSyncRequest {
 				break
 			}
 		}
@@ -126,7 +133,7 @@ func main() {
 	})
 
 	b := &broker{
-		clients:   make(map[string]map[string]*websocket.Conn),
+		clients:   make(map[string]map[string]client),
 		synced:    make(map[string]map[string]struct{}),
 		broadcast: make(chan envelope),
 	}
@@ -134,9 +141,9 @@ func main() {
 	go b.listen()
 
 	app.Get("/+", websocket.New(func(conn *websocket.Conn) {
-		c := b.newClient(conn)
+		c := b.client(conn)
 
-		defer b.dropClient(c)
+		defer b.drop(c)
 
 		for {
 			var m message
@@ -156,7 +163,10 @@ func main() {
 			}
 			log.Println("message received:", m)
 
-			b.broadcast <- envelope{m, *c}
+			b.broadcast <- envelope{
+				sender:  c,
+				message: m,
+			}
 		}
 	}))
 
