@@ -9,7 +9,6 @@ import (
 	"os"
 
 	"github.com/gofiber/fiber/v2"
-	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/gofiber/websocket/v2"
 )
 
@@ -118,8 +117,6 @@ func (b *broker) listen() {
 
 func main() {
 	app := fiber.New()
-
-	app.Use(logger.New())
 
 	app.Use(func(c *fiber.Ctx) error {
 		if websocket.IsWebSocketUpgrade(c) {
