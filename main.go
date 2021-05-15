@@ -2,15 +2,20 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"os"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/gofiber/websocket/v2"
-	"github.com/rs/xid"
 )
+
+func newId() string {
+	return fmt.Sprintf("%x", rand.Uint32())
+}
 
 type message struct {
 	Type    string                 `json:"type"`
@@ -37,7 +42,7 @@ type broker struct {
 func (b *broker) newClient(conn *websocket.Conn) *client {
 	c := &client{
 		channel: conn.Params("+1"),
-		id:      xid.New().String(),
+		id:      newId(),
 	}
 	if b.clients[c.channel] == nil {
 		b.clients[c.channel] = map[string]*websocket.Conn{}
