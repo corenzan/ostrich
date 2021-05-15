@@ -2,10 +2,8 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"os"
 
 	"github.com/gofiber/fiber/v2"
@@ -17,14 +15,10 @@ const (
 	messageTypeSyncRequest = "ostrich/sync/request"
 )
 
-func newId() string {
-	return fmt.Sprintf("%x", rand.Uint32())
-}
-
 type message struct {
 	Type    string                 `json:"type"`
-	Meta    map[string]interface{} `json:"meta"`
-	Payload interface{}            `json:"payload"`
+	Meta    map[string]interface{} `json:"meta,omitempty"`
+	Payload interface{}            `json:"payload,omitempty"`
 }
 
 type client struct {
@@ -39,48 +33,49 @@ type envelope struct {
 }
 
 type broker struct {
-	clients   map[string]map[string]client
-	synced    map[string]map[string]struct{}
+	clients   map[string]map[client]struct{}
+	synced    map[string]map[client]struct{}
 	broadcast chan envelope
 }
 
 func (b *broker) client(conn *websocket.Conn) client {
 	c := client{
 		channel: conn.Params("+1"),
-		id:      newId(),
 		conn:    conn,
 	}
+
 	if b.clients[c.channel] == nil {
-		b.clients[c.channel] = map[string]client{}
-		b.synced[c.channel] = map[string]struct{}{
-			c.id: {},
+		b.clients[c.channel] = map[client]struct{}{
+			c: {},
+		}
+		b.synced[c.channel] = map[client]struct{}{
+			c: {},
 		}
 	} else {
 		b.broadcast <- envelope{
 			sender:  client{c.channel, "", nil},
 			message: message{messageTypeSyncRequest, nil, nil},
 		}
+		b.clients[c.channel][c] = struct{}{}
 	}
-	b.clients[c.channel][c.id] = c
 	return c
 }
 
 func (b *broker) drop(c client) {
 	c.conn.Close()
 
-	delete(b.clients[c.channel], c.id)
-	delete(b.synced[c.channel], c.id)
+	delete(b.clients[c.channel], c)
+	delete(b.synced[c.channel], c)
 
 	if len(b.clients[c.channel]) == 0 {
 		delete(b.clients, c.channel)
 		delete(b.synced, c.channel)
 	} else if len(b.synced[c.channel]) == 0 {
-		for id := range b.clients[c.channel] {
-			b.synced[c.channel][id] = struct{}{}
+		for c := range b.clients[c.channel] {
+			b.synced[c.channel][c] = struct{}{}
 			break
 		}
 	}
-
 }
 
 func (b *broker) listen() {
@@ -92,12 +87,12 @@ func (b *broker) listen() {
 		}
 		e.message.Meta["remote"] = true
 
-		for id, c := range b.clients[e.sender.channel] {
-			if id == e.sender.id {
+		for c := range b.clients[e.sender.channel] {
+			if c == e.sender {
 				continue
 			}
 
-			_, synced := b.synced[e.sender.channel][id]
+			_, synced := b.synced[e.sender.channel][c]
 
 			if synced {
 				if e.message.Type == messageTypeSyncReply {
@@ -110,7 +105,7 @@ func (b *broker) listen() {
 			}
 
 			if err := c.conn.WriteJSON(e.message); err == nil {
-				b.synced[e.sender.channel][id] = struct{}{}
+				b.synced[e.sender.channel][c] = struct{}{}
 			} else {
 				log.Println("failed to send message:", err)
 			}
@@ -133,8 +128,8 @@ func main() {
 	})
 
 	b := &broker{
-		clients:   make(map[string]map[string]client),
-		synced:    make(map[string]map[string]struct{}),
+		clients:   make(map[string]map[client]struct{}),
+		synced:    make(map[string]map[client]struct{}),
 		broadcast: make(chan envelope),
 	}
 
@@ -142,7 +137,6 @@ func main() {
 
 	app.Get("/+", websocket.New(func(conn *websocket.Conn) {
 		c := b.client(conn)
-
 		defer b.drop(c)
 
 		for {
