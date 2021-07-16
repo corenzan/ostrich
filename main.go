@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"io"
-	"log"
 	"os"
 
 	"github.com/gofiber/fiber/v2"
@@ -11,157 +10,222 @@ import (
 )
 
 const (
-	messageTypeSyncReply   = "ostrich/sync/reply"
-	messageTypeSyncRequest = "ostrich/sync/request"
+	catchUpReply = "ostrich/catch-up/reply"
+	catchUpReq   = "ostrich/catch-up/request"
 )
 
-type message struct {
+// Envelope wraps a message with a sender and the destination channel.
+type Envelope struct {
+	Sender    *Client
+	Recipient *Channel
+	Message   *Message
+}
+
+// Message encodes/decodes exchanged messages.
+type Message struct {
 	Type    string                 `json:"type"`
 	Meta    map[string]interface{} `json:"meta,omitempty"`
 	Payload interface{}            `json:"payload,omitempty"`
 }
 
-type client struct {
-	channel string
-	id      string
-	conn    *websocket.Conn
+// -
+// -
+// -
+
+// Client wraps a socket connection.
+type Client struct {
+	Conn *websocket.Conn
 }
 
-type envelope struct {
-	sender  client
-	message message
-}
-
-type broker struct {
-	clients   map[string]map[client]struct{}
-	stale     map[string]map[client]struct{}
-	broadcast chan envelope
-}
-
-func (b *broker) client(conn *websocket.Conn) client {
-	c := client{
-		channel: conn.Params("+1"),
-		conn:    conn,
+// Write writes given message to the client's underlying connection.
+func (c *Client) Write(m *Message) error {
+	if m.Meta == nil {
+		m.Meta = map[string]interface{}{}
 	}
+	m.Meta["remote"] = true
 
-	if b.clients[c.channel] == nil {
-		b.clients[c.channel] = map[client]struct{}{
-			c: {},
-		}
-		b.stale[c.channel] = map[client]struct{}{}
-	} else {
-		b.broadcast <- envelope{
-			sender:  client{c.channel, "", nil},
-			message: message{messageTypeSyncRequest, nil, nil},
-		}
-		b.clients[c.channel][c] = struct{}{}
-		b.stale[c.channel][c] = struct{}{}
-	}
-	return c
+	return c.Conn.WriteJSON(m)
 }
 
-func (b *broker) drop(c client) {
-	c.conn.Close()
+// Read reads JSON messages from the client's underlying connection.
+func (c *Client) Read() (*Message, error) {
+	var m *Message
 
-	delete(b.clients[c.channel], c)
-	delete(b.stale[c.channel], c)
+	for {
+		err := c.Conn.ReadJSON(m)
+		if err != nil {
+			if err == io.ErrUnexpectedEOF {
+				continue
+			} else if _, ok := err.(*json.UnmarshalTypeError); ok {
+				continue
+			} else if _, ok := err.(*json.SyntaxError); ok {
+				continue
+			}
+			return nil, err
+		}
+		return m, nil
+	}
+}
 
-	if l := len(b.clients[c.channel]); l == 0 {
-		delete(b.clients, c.channel)
-		delete(b.stale, c.channel)
-	} else if l == len(b.stale[c.channel]) {
-		for c := range b.stale[c.channel] {
-			delete(b.stale[c.channel], c)
+// Closes closes underlying connection.
+func (c *Client) Close() error {
+	return c.Conn.Close()
+}
+
+// -
+// -
+// -
+
+// Channel ...
+type Channel struct {
+	Name    string
+	Clients map[*Client]struct{}
+	Stale   map[*Client]struct{}
+}
+
+// Deliverable tells if given envelope should be delivered to given recipient.
+func (ch *Channel) Deliverable(recipient *Client, envelope *Envelope) bool {
+	if recipient == envelope.Sender {
+		return false
+	}
+	if _, stale := ch.Stale[recipient]; stale {
+		return envelope.Message.Type != catchUpReply
+	}
+	return envelope.Message.Type == catchUpReply
+}
+
+// Broadcast given envelope to the whole channel.
+func (ch *Channel) Broadcast(envelope *Envelope) error {
+	for client := range ch.Clients {
+		if ch.Deliverable(client, envelope) {
+			continue
+		}
+
+		if err := client.Write(envelope.Message); err != nil {
+			return err
+		}
+		delete(ch.Stale, client)
+
+		// Halts after delivering one catch-up request.
+		if envelope.Message.Type == catchUpReq {
 			break
 		}
 	}
+	return nil
 }
 
-func (b *broker) listen() {
-	for {
-		e := <-b.broadcast
+// Client registers and returns a new client in the channel.
+func (ch *Channel) Client(conn *websocket.Conn) *Client {
+	cl := &Client{conn}
 
-		if e.message.Meta == nil {
-			e.message.Meta = map[string]interface{}{}
-		}
-		e.message.Meta["remote"] = true
+	ch.Clients[cl] = struct{}{}
+	ch.Stale[cl] = struct{}{}
 
-		for c := range b.clients[e.sender.channel] {
-			if c == e.sender {
-				continue
-			}
+	return cl
+}
 
-			_, stale := b.stale[e.sender.channel][c]
+// Count ...
+func (ch *Channel) Count() int {
+	return len(ch.Clients)
+}
 
-			if stale {
-				if e.message.Type != messageTypeSyncReply {
-					continue
-				}
-			} else {
-				if e.message.Type == messageTypeSyncReply {
-					continue
-				}
-			}
+// Unregister drops given client.
+func (ch *Channel) Unregister(cl *Client) {
+	delete(ch.Clients, cl)
+	delete(ch.Stale, cl)
+}
 
-			if err := c.conn.WriteJSON(e.message); err == nil {
-				delete(b.stale[c.channel], c)
-			} else {
-				log.Println("failed to send message:", err)
-			}
+// -
+// -
+// -
 
-			if e.message.Type == messageTypeSyncRequest {
-				break
-			}
-		}
+// Broker manages the channels and handles the massaging.
+type Broker struct {
+	Channels map[string]*Channel
+	Dispatch chan *Envelope
+}
+
+// Channel registers and returns a new channel.
+func (b *Broker) Channel(name string) *Channel {
+	if channel, ok := b.Channels[name]; ok {
+		return channel
+	}
+	channel := &Channel{
+		Name:    name,
+		Clients: make(map[*Client]struct{}),
+		Stale:   make(map[*Client]struct{}),
+	}
+	b.Channels[name] = channel
+	return channel
+}
+
+// Register handles incoming connections.
+func (b *Broker) Register(conn *websocket.Conn) (*Channel, *Client) {
+	ch := b.Channel(conn.Params("+1"))
+	cl := ch.Client(conn)
+
+	b.Dispatch <- b.Envelop(nil, ch, nil) // TODO
+
+	return ch, cl
+}
+
+// Envelop ...
+func (b *Broker) Envelop(cl *Client, ch *Channel, m *Message) *Envelope {
+	return &Envelope{cl, ch, m}
+}
+
+// Unregister drops given client.
+func (b *Broker) Unregister(ch *Channel, cl *Client) {
+	ch.Unregister(cl)
+
+	if ch.Count() < 1 {
+		delete(b.Channels, ch.Name)
 	}
 }
 
-func main() {
-	app := fiber.New()
+// Listen listens to dispatch requests.
+func (b *Broker) Listen() {
+	for {
+		e := <-b.Dispatch
+		e.Recipient.Broadcast(e)
+	}
+}
 
-	app.Use(func(c *fiber.Ctx) error {
+// -
+// -
+// -
+
+func main() {
+	f := fiber.New()
+
+	f.Use(func(c *fiber.Ctx) error {
 		if websocket.IsWebSocketUpgrade(c) {
 			return c.Next()
 		}
 		return c.SendStatus(fiber.StatusUpgradeRequired)
 	})
 
-	b := &broker{
-		clients:   make(map[string]map[client]struct{}),
-		stale:     make(map[string]map[client]struct{}),
-		broadcast: make(chan envelope),
+	b := &Broker{
+		Channels: make(map[string]*Channel),
 	}
 
-	go b.listen()
+	go b.Listen()
 
-	app.Get("/+", websocket.New(func(conn *websocket.Conn) {
-		c := b.client(conn)
-		defer b.drop(c)
+	f.Get("/+", websocket.New(func(conn *websocket.Conn) {
+		ch, cl := b.Register(conn)
+
+		defer b.Unregister(ch, cl)
 
 		for {
-			var m message
+			m, err := cl.Read()
 
-			if err := conn.ReadJSON(&m); err != nil {
-				log.Println("failed to read message:", err)
-
-				if err == io.ErrUnexpectedEOF {
-					continue
-				} else if _, ok := err.(*json.UnmarshalTypeError); ok {
-					continue
-				} else if _, ok := err.(*json.SyntaxError); ok {
-					continue
-				}
-
-				return
+			if err != nil {
+				break
 			}
-			log.Println("message received:", m)
 
-			b.broadcast <- envelope{
-				sender:  c,
-				message: m,
-			}
+			b.Dispatch <- b.Envelop(cl, ch, m)
 		}
 	}))
 
-	app.Listen(":" + os.Getenv("PORT"))
+	f.Listen(":" + os.Getenv("PORT"))
 }
